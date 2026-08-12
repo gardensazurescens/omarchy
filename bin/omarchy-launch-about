@@ -2,13 +2,23 @@
 
 # omarchy:summary=Launch the fastfetch TUI that gives information about the current system.
 
-# The float rule only sets a starting size: the exact fit depends on the terminal
-# font and the user's About logo, so once the terminal grid has settled we measure
-# the rendered content and resize the window to hug it with even padding all around.
-# Bash defers WINCH traps while read blocks, so poll for size changes and re-render
-# fastfetch at the new width whenever the window is resized.
+# The exact size that hugs the About content depends on the terminal font and the
+# user's About logo, so it can only be measured from inside the terminal once the
+# grid has settled. We remember the size that fit last time and apply it as a
+# window rule before launching, so the window opens hugging its content instead of
+# resizing after the first paint. The render side keeps that memory honest: it
+# measures again, refits whenever the remembered size is wrong, and stores the new
+# fit for next time. Bash defers WINCH traps while read blocks, so poll for size
+# changes and re-render fastfetch at the new width whenever the window is resized.
 
 LOGO_FILE="$HOME/.config/omarchy/branding/about.txt"
+FIT_FILE="$HOME/.local/state/omarchy/windows/about.fit"
+
+# A user-level fastfetch config can relocate or restyle the logo in ways this
+# measurement cannot see, so leave sizing to the float rule in that case.
+custom_fastfetch_config() {
+  [[ -f $HOME/.config/fastfetch/config.jsonc ]]
+}
 
 # wc -L measures display columns, so double-width glyphs count correctly, but
 # only in a UTF-8 locale. A session that never set one leaves it counting bytes
@@ -18,28 +28,96 @@ display_columns() {
   LC_ALL=C.UTF-8 wc -L
 }
 
+logo_dimensions() {
+  [[ -f $LOGO_FILE ]] || return 1
+  printf '%s %s' "$(display_columns <"$LOGO_FILE")" "$(wc -l <"$LOGO_FILE")"
+}
+
 hypr_dispatch() {
   local lua="$1"
   shift
   hyprctl dispatch "$lua" >/dev/null 2>&1 || hyprctl dispatch "$@" >/dev/null
 }
 
+# Turning a column count into pixels needs the terminal's cell size, which only
+# the terminal knows: its padding and the rounding a fractional monitor scale
+# adds leave the window itself a poor guide. Terminals report the cell in real
+# pixels, so the monitor's scale converts it to the coordinates Hyprland resizes
+# in, and both come back as thousandths to keep the division honest.
+cell_size() {
+  local attempt response cell_w cell_h scale
+  local reply=$'\e\\[6;([0-9]+);([0-9]+)$'
+
+  # fastfetch asks the terminal questions of its own and does not always collect
+  # the answers, so read past anything still queued and match on the tail.
+  printf '\e[16t' >/dev/tty
+  for attempt in 1 2 3; do
+    IFS= read -r -s -n 32 -t 0.2 -d t response </dev/tty || return 1
+    [[ $response =~ $reply ]] && break
+    response=""
+  done
+  [[ -n $response ]] || return 1
+  cell_h="${BASH_REMATCH[1]}"
+  cell_w="${BASH_REMATCH[2]}"
+
+  # Hyprland reports the scale with six decimals, of which three are plenty.
+  scale=$(hyprctl monitors -j | jq -r --argjson monitor "$1" '.[] | select(.id == $monitor) | .scale * 1000 | round')
+  [[ $scale =~ ^[0-9]+$ ]] && (( scale > 0 )) || return 1
+
+  printf '%s %s' "$(( cell_w * 1000000 / scale ))" "$(( cell_h * 1000000 / scale ))"
+}
+
+remember_fit() {
+  local directory tmp
+  directory=$(dirname "$FIT_FILE")
+  mkdir -p "$directory"
+  tmp=$(mktemp "$directory/.about.fit.XXXXXX")
+  printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" >"$tmp"
+  mv "$tmp" "$FIT_FILE"
+}
+
+# Always replaces the rule from the last launch, so a remembered size never
+# outlives the fit it came from, and calling this without one drops back to the
+# starting size in the float rule. A Hyprland without the Lua API keeps that
+# starting size too, and lets the render side fit the window as it always did.
+apply_size_rule() {
+  local rule=""
+  (( $# == 2 )) && rule="omarchy_about_size_rule = hl.window_rule({ match = { class = \"org.omarchy.about\" }, size = { $1, $2 } })"
+
+  hyprctl eval "if omarchy_about_size_rule then omarchy_about_size_rule:set_enabled(false) end; omarchy_about_size_rule = nil; $rule" >/dev/null 2>&1
+}
+
+# Sized before the terminal is spawned, so the window maps at its final size.
+presize_window() {
+  local logo_w logo_h fit_logo_w fit_logo_h fit_w fit_h
+
+  if ! custom_fastfetch_config && [[ -r $FIT_FILE ]]; then
+    read -r logo_w logo_h <<<"$(logo_dimensions)"
+    read -r fit_logo_w fit_logo_h fit_w fit_h <"$FIT_FILE"
+
+    # The remembered size was measured for one logo: a different one needs a
+    # different window, so leave that launch to the float rule.
+    if [[ -n ${logo_w:-} && $logo_w == "$fit_logo_w" && $logo_h == "$fit_logo_h" ]] &&
+      [[ $fit_w =~ ^[0-9]+$ && $fit_h =~ ^[0-9]+$ ]]; then
+      apply_size_rule "$fit_w" "$fit_h"
+      return
+    fi
+  fi
+
+  apply_size_rule
+}
+
+# Measures how many columns and rows the About layout takes, then walks the
+# window towards that grid: a resize lands on whatever cell boundary the terminal
+# picks, so the result is measured again and nudged until it matches. Only the
+# first launch after a rebranding or a font change gets this far, since the size
+# it settles on is remembered and every launch after that opens at it.
 fit_window() {
-  # A user-level fastfetch config can relocate or restyle the logo in ways this
-  # measurement cannot see, so leave sizing to the float rule in that case.
-  [[ -f $HOME/.config/fastfetch/config.jsonc ]] && return 0
+  custom_fastfetch_config && return 0
 
-  local rows cols address width height
-  read -r rows cols <<<"$(stty size)"
-  read -r address width height <<<"$(hyprctl clients -j | jq -r '.[] | select(.class == "org.omarchy.about") | "\(.address) \(.size[0]) \(.size[1])"')"
-  [[ -f $LOGO_FILE && -n ${address:-} ]] || return 1
-  (( cols > 0 && rows > 0 && width > 0 && height > 0 )) || return 1
-
-  # Mirror the logo block in the fastfetch config: 2 columns of padding on the
-  # left of the logo, 6 between the logo and the modules, 2 rows above the logo.
   local logo_w logo_h
-  logo_w=$(display_columns <"$LOGO_FILE")
-  logo_h=$(( $(wc -l <"$LOGO_FILE") + 2 ))
+  read -r logo_w logo_h <<<"$(logo_dimensions)"
+  [[ -n ${logo_w:-} ]] || return 1
 
   # The guard character keeps command substitution from eating the trailing
   # break line, which provides the bottom padding row.
@@ -49,31 +127,91 @@ fit_window() {
   module_w=$(printf '%s' "$modules" | display_columns)
   module_h=$(printf '%s' "$modules" | wc -l)
 
-  # Two columns of right padding to match the logo's left padding, and one row
-  # for the cursor line so the trailing break stays visible as bottom padding.
+  # Mirror the logo block in the fastfetch config: 2 columns of padding on the
+  # left of the logo, 6 between the logo and the modules, 2 rows above the logo.
+  # Then two columns of right padding to match the logo's left padding, and one
+  # row for the cursor line so the trailing break stays visible as bottom padding.
+  local logo_rows=$(( logo_h + 2 ))
   local target_c=$(( 2 + logo_w + 6 + module_w + 2 ))
-  local target_r=$(( (logo_h > module_h ? logo_h : module_h) + 1 ))
-  local target_w=$(( (target_c * width + cols / 2) / cols ))
-  local target_h=$(( (target_r * height + rows / 2) / rows ))
+  local target_r=$(( (logo_rows > module_h ? logo_rows : module_h) + 1 ))
 
-  # Skip resizes within one terminal cell so the fit doesn't churn.
-  (( (target_w - width) ** 2 <= (width / cols) ** 2 && (target_h - height) ** 2 <= (height / rows) ** 2 )) && return
+  # Ask the terminal how big its cells are only once it has stopped reflowing,
+  # since a terminal still catching up with the monitor's scale answers for the
+  # size it was rendering at a moment ago.
+  local monitor cell_w cell_h
+  settle_grid
+  monitor=$(hyprctl clients -j | jq -r 'first(.[] | select(.class == "org.omarchy.about")) | .monitor')
+  read -r cell_w cell_h <<<"$(cell_size "$monitor")"
+
+  local attempt
+  for attempt in 1 2 3 4; do
+    fit_window_once "$target_c" "$target_r" "$logo_w" "$logo_h" "${cell_w:-}" "${cell_h:-}" && return 0
+    settle_grid
+  done
+
+  return 1
+}
+
+# Hyprland animates a resize, and the terminal reflows to every step of it, so a
+# grid read too early describes a window that is still on its way somewhere else.
+# Wait for it to hold still before believing it.
+settle_grid() {
+  local current previous="" held=0
+
+  for _ in {1..20}; do
+    current=$(stty size)
+    if [[ $current == $previous ]]; then
+      (( ++held == 3 )) && break
+    else
+      held=0
+      previous=$current
+    fi
+    sleep 0.05
+  done
+}
+
+fit_window_once() {
+  local target_c="$1" target_r="$2" logo_w="$3" logo_h="$4" cell_w="$5" cell_h="$6"
+  local rows cols address width height target_w target_h
+
+  read -r rows cols <<<"$(stty size)"
+  read -r address width height <<<"$(hyprctl clients -j | jq -r '.[] | select(.class == "org.omarchy.about") | "\(.address) \(.size[0]) \(.size[1])"')"
+  [[ -n ${address:-} ]] || return 1
+  (( cols > 0 && rows > 0 && width > 0 && height > 0 )) || return 1
+
+  # The window already carries the grid the content needs, so leave it where it
+  # is and remember the size that got us there for the next launch.
+  if (( cols == target_c && rows == target_r )); then
+    remember_fit "$logo_w" "$logo_h" "$width" "$height"
+    return 0
+  fi
+
+  # Move by the columns and rows the content is missing, anchored on the window
+  # in front of us: whatever padding it carries comes along untouched that way,
+  # where sizing it from scratch would have to guess at it. A terminal that will
+  # not say how big its cells are leaves the window as the only guide, which its
+  # padding makes a little too generous, so the walk takes an extra step or two.
+  local grow_w=$(( (target_c - cols) * ${cell_w:-$(( width * 1000 / cols ))} ))
+  local grow_h=$(( (target_r - rows) * ${cell_h:-$(( height * 1000 / rows ))} ))
+
+  # Those thousandths of a pixel round towards the window with room to spare, so
+  # that rounding alone can never leave the content a cell short.
+  target_w=$(( width + (grow_w >= 0 ? (grow_w + 999) / 1000 : grow_w / 1000) ))
+  target_h=$(( height + (grow_h >= 0 ? (grow_h + 999) / 1000 : grow_h / 1000) ))
 
   hypr_dispatch "hl.dsp.window.resize({ window = \"address:$address\", x = $target_w, y = $target_h })" resizewindowpixel "exact $target_w $target_h,address:$address"
   hypr_dispatch "hl.dsp.window.center({ window = \"address:$address\" })" centerwindow
+  return 1
 }
 
 if [[ ${1:-} == "--render" ]]; then
+  # Nothing typed at this screen belongs on it, including the terminal's own
+  # answer when it is asked how big its cells are.
   printf '\e[?25l'
+  stty -echo
 
-  # Give the compositor a moment to apply the float rule before measuring cells.
-  previous=""
-  for _ in {1..20}; do
-    current=$(stty size)
-    [[ $current == $previous ]] && break
-    previous=$current
-    sleep 0.05
-  done
+  # Give the compositor a moment to apply the window rules before measuring cells.
+  settle_grid
 
   fitted=false
   while :; do
@@ -81,7 +219,10 @@ if [[ ${1:-} == "--render" ]]; then
     logo_stamp=$(stat -c %Y "$LOGO_FILE" 2>/dev/null)
     clear
     fastfetch
-    if [[ $fitted == false ]] && fit_window; then
+    # One pass is all it gets: fitting settles the window itself, and a window
+    # it cannot fit is one that would keep asking on every repaint.
+    if [[ $fitted == false ]]; then
+      fit_window
       fitted=true
     fi
     while [[ $(stty size) == $size && $(stat -c %Y "$LOGO_FILE" 2>/dev/null) == $logo_stamp ]]; do
@@ -93,4 +234,5 @@ if [[ ${1:-} == "--render" ]]; then
   done
 fi
 
+presize_window
 exec omarchy-launch-or-focus-tui --app-id=org.omarchy.about omarchy-launch-about --render
